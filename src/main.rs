@@ -122,51 +122,51 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
-    show!(i2c, "WIFI");
-    log::info!("Joining wifi network '{}'", WIFI_SSID);
-
-    loop {
-        match control
-            .join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
-            .await
-        {
-            Ok(_) => {
-                log::info!("WiFi joined");
-                break;
-            }
-            Err(e) => {
-                log::warn!("WiFi join failed: {:?}, retrying...", e);
-                show!(i2c, "WERR");
-                Timer::after(Duration::from_secs(2)).await;
-                show!(i2c, "WIFI");
-            }
-        }
-    }
-
-    show!(i2c, "LINK");
-    while !stack.is_link_up() {
-        log::info!("Waiting for link up...");
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
-    show!(i2c, "DHCP");
-    log::info!("Waiting for DHCP...");
-    stack.wait_config_up().await;
-    log::info!("Network up: {:?}", stack.config_v4());
-
-    static TCP_STATE: StaticCell<TcpClientState<2, 1024, 1024>> = StaticCell::new();
-    let tcp_state = TCP_STATE.init(TcpClientState::new());
-    let tcp_client = TcpClient::new(stack, tcp_state);
-    let dns_socket = DnsSocket::new(stack);
-    let mut client = HttpClient::new(&tcp_client, &dns_socket);
-
     let url = "http://wttr.in/Vienna?format=%t";
 
     loop {
+        show!(i2c, "WIFI");
+        log::info!("Joining wifi network '{}'", WIFI_SSID);
+
+        loop {
+            match control
+                .join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
+                .await
+            {
+                Ok(_) => {
+                    log::info!("WiFi joined");
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("WiFi join failed: {:?}, retrying...", e);
+                    show!(i2c, "WERR");
+                    Timer::after(Duration::from_secs(2)).await;
+                    show!(i2c, "WIFI");
+                }
+            }
+        }
+
+        show!(i2c, "LINK");
+        while !stack.is_link_up() {
+            log::info!("Waiting for link up...");
+            Timer::after(Duration::from_millis(500)).await;
+        }
+
+        show!(i2c, "DHCP");
+        log::info!("Waiting for DHCP...");
+        stack.wait_config_up().await;
+        log::info!("Network up: {:?}", stack.config_v4());
+
+        static TCP_STATE: StaticCell<TcpClientState<2, 1024, 1024>> = StaticCell::new();
+        let tcp_state = TCP_STATE.init(TcpClientState::new());
+        let tcp_client = TcpClient::new(stack, tcp_state);
+        let dns_socket = DnsSocket::new(stack);
+        let mut client = HttpClient::new(&tcp_client, &dns_socket);
+
         show!(i2c, "HTTP");
         log::info!("Fetching weather...");
 
-        let success = 'fetch: {
+        let _ = 'fetch: {
             let mut req = match client.request(Method::GET, url).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -208,16 +208,16 @@ async fn main(spawner: Spawner) {
 
             log::info!("Showing: {}", aligned.as_str());
 
+            let _ = control.leave().await;
+            control
+                .set_power_management(cyw43::PowerManagementMode::Aggressive)
+                .await;
+
             show!(i2c, aligned.as_str());
 
             true
         };
 
-        if success {
-            Timer::after(Duration::from_secs(60)).await;
-        } else {
-            show!(i2c, "ERR ");
-            Timer::after(Duration::from_secs(5)).await;
-        }
+        Timer::after(Duration::from_secs(15 * 60)).await;
     }
 }
