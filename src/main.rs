@@ -1,38 +1,53 @@
 #![no_std]
 #![no_main]
 
+mod animation;
 mod display;
 mod glyph;
 
-use cyw43::{JoinOptions, aligned_bytes};
+use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+
+use core::fmt::Write;
+use cyw43::{Control, JoinOptions, aligned_bytes};
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use display::Display;
 use embassy_executor::Spawner;
-use embassy_net::StackResources;
 use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::{Stack, StackResources};
+use embassy_rp::adc::{Adc, Channel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c::{Config, I2c};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C1, PIO0, USB};
 use embassy_rp::pio::Pio;
 use embassy_rp::usb::Driver;
 use embassy_rp::{bind_interrupts, dma};
-use embassy_time::{Duration, Timer};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_async::i2c::I2c as _;
 use embedded_io_async::Read;
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 use static_cell::StaticCell;
 
+use crate::animation::LOADING;
+use crate::display::segment_to_frame_byte;
+
 use {defmt_rtt as _, panic_probe as _};
 
 const ADDR: u8 = 0x71;
+
+static WIFI_ERROR: Mutex<CriticalSectionRawMutex, Option<heapless::String<4>>> = Mutex::new(None);
+static DISPLAY_BRIGHTNESS: AtomicU8 = AtomicU8::new(9);
+static OUTSIDE_TEMP: AtomicI8 = AtomicI8::new(-128);
 
 bind_interrupts!(struct Irqs {
     I2C1_IRQ => embassy_rp::i2c::InterruptHandler<I2C1>;
     PIO0_IRQ_0 => embassy_rp::pio::InterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
     USBCTRL_IRQ => embassy_rp::usb::InterruptHandler<USB>;
+    ADC_IRQ_FIFO => AdcInterruptHandler;
 });
 
 #[embassy_executor::task]
@@ -52,10 +67,145 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn potentiometer_brightness_task(
+    mut adc: Adc<'static, embassy_rp::adc::Async>,
+    mut pin: Channel<'static>,
+) {
+    loop {
+        let raw = adc.read(&mut pin).await.unwrap();
+        log::trace!("Raw brightness value (0 - 4095): {}", raw);
+        let brightness = (raw / 256) as u8;
+        log::debug!("Brightness value (0 - 15): {}", brightness);
+        DISPLAY_BRIGHTNESS.store(brightness, Ordering::Relaxed);
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+async fn join_wifi(
+    control: &mut Control<'_>,
+    stack: &Stack<'_>,
+    wifi_ssid: &str,
+    wifi_password: &str,
+) {
+    log::info!("Joining wifi network '{}'", wifi_ssid);
+    loop {
+        match control
+            .join(wifi_ssid, JoinOptions::new(wifi_password.as_bytes()))
+            .await
+        {
+            Ok(_) => {
+                log::info!("Wifi joined");
+                break;
+            }
+            Err(e) => {
+                log::warn!("Wifi join failed: {:?}, retrying...", e);
+                {
+                    let mut error = WIFI_ERROR.lock().await;
+                    *error = Some(heapless::String::try_from("WE01").unwrap());
+                }
+                Timer::after(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    while !stack.is_link_up() {
+        log::info!("Waiting for link up...");
+        Timer::after(Duration::from_millis(500)).await;
+    }
+    log::info!("Waiting for DHCP...");
+    stack.wait_config_up().await;
+    log::info!("Network up: {:?}", stack.config_v4());
+}
+
+#[embassy_executor::task]
+async fn outside_temperature_task(
+    wttr_url: &'static str,
+    wifi_ssid: &'static str,
+    wifi_password: &'static str,
+    mut control: Control<'static>,
+    stack: Stack<'static>,
+) -> ! {
+    static TCP_STATE: StaticCell<TcpClientState<2, 1024, 1024>> = StaticCell::new();
+    let tcp_state = TCP_STATE.init(TcpClientState::new());
+    let tcp_client = TcpClient::new(stack, tcp_state);
+    let dns_socket = DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp_client, &dns_socket);
+
+    loop {
+        control
+            .set_power_management(cyw43::PowerManagementMode::None)
+            .await;
+
+        if !stack.is_link_up() {
+            join_wifi(&mut control, &stack, wifi_ssid, wifi_password).await;
+        }
+
+        log::info!("Fetching outside temperature...");
+
+        'fetch: {
+            let mut req = match client.request(Method::GET, wttr_url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("HTTP request failed: {:?}", e);
+                    break 'fetch;
+                }
+            };
+
+            let mut rx_buf = [0u8; 4096];
+            let response = match req.send(&mut rx_buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("HTTP send failed: {:?}", e);
+                    break 'fetch;
+                }
+            };
+
+            let mut body_buf = [0u8; 64];
+            let n = match response.body().reader().read(&mut body_buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    log::error!("Body read error: {:?}", e);
+                    break 'fetch;
+                }
+            };
+
+            let s = match core::str::from_utf8(&body_buf[..n]) {
+                Ok(s) => s.trim().trim_start_matches('+').trim_end_matches("°C"),
+                Err(e) => {
+                    log::error!("Body not valid UTF-8: {:?}", e);
+                    break 'fetch;
+                }
+            };
+
+            OUTSIDE_TEMP.store(s.parse().unwrap_or(-128), Ordering::Relaxed);
+        };
+
+        control
+            .set_power_management(cyw43::PowerManagementMode::Aggressive)
+            .await;
+
+        Timer::after(Duration::from_secs(15 * 60)).await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     const WIFI_SSID: &str = env!("WIFI_SSID");
     const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+    const WTTR_LOCATION: &str = env!("WTTR_LOCATION");
+
+    const MAX_URL_LEN: usize = 128;
+    const UNPARAMETERIZED_URL: &str = "http://wttr.in/?format=%t";
+
+    const _: () = {
+        assert!(!WIFI_SSID.is_empty(), "WIFI_SSID must not be empty");
+        assert!(!WIFI_PASSWORD.is_empty(), "WIFI_PASSWORD must not be empty");
+        assert!(!WTTR_LOCATION.is_empty(), "WTTR_LOCATION must not be empty");
+        assert!(
+            UNPARAMETERIZED_URL.len() + WTTR_LOCATION.len() <= MAX_URL_LEN,
+            "WTTR_LOCATION too long, URL would exceed 128 chars"
+        );
+    };
 
     // Set up peripherals
     let p = embassy_rp::init(Default::default());
@@ -64,13 +214,18 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
     spawner.spawn(logger_task(driver).unwrap());
 
+    // Set up brightness potentiometer
+    let adc = Adc::new(p.ADC, Irqs, AdcConfig::default());
+    let pot_pin = Channel::new_pin(p.PIN_26, embassy_rp::gpio::Pull::None);
+    spawner.spawn(potentiometer_brightness_task(adc, pot_pin).unwrap());
+
     // Set up i2c aka 14 segment display
     let mut cfg = Config::default();
     cfg.frequency = 100_000;
     let mut i2c = I2c::new_async(p.I2C1, p.PIN_15, p.PIN_14, Irqs, cfg);
     i2c.write(ADDR, &[0x21]).await.unwrap();
     i2c.write(ADDR, &[0x81]).await.unwrap();
-    i2c.write(ADDR, &[0xEF]).await.unwrap();
+    i2c.write(ADDR, &[0xE0]).await.unwrap();
 
     macro_rules! show {
         ($i2c:expr, $s:expr) => {
@@ -79,8 +234,6 @@ async fn main(spawner: Spawner) {
             }
         };
     }
-
-    show!(i2c, "INIT");
 
     // Set up wifi
     let fw = aligned_bytes!("../firmware/43439A0.bin");
@@ -118,106 +271,34 @@ async fn main(spawner: Spawner) {
     spawner.spawn(cyw43_task(runner).unwrap());
     spawner.spawn(net_task(runner_net).unwrap());
     control.init(clm).await;
-    control
-        .set_power_management(cyw43::PowerManagementMode::None)
-        .await;
 
-    let url = "http://wttr.in/Vienna?format=%t";
+    let mut url: heapless::String<MAX_URL_LEN> = heapless::String::new();
+    let _ = write!(url, "http://wttr.in/{}?format=%t", WTTR_LOCATION);
+    static URL: StaticCell<heapless::String<MAX_URL_LEN>> = StaticCell::new();
+    let url = URL.init(url);
+
+    spawner.spawn(
+        outside_temperature_task(url.as_str(), WIFI_SSID, WIFI_PASSWORD, control, stack).unwrap(),
+    );
 
     loop {
-        show!(i2c, "WIFI");
-        log::info!("Joining wifi network '{}'", WIFI_SSID);
+        let current_outside_temp = OUTSIDE_TEMP.load(Ordering::Relaxed);
+        let display_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
+        i2c.write(ADDR, &[0xE0 + display_brightness]).await.unwrap();
 
-        loop {
-            match control
-                .join(WIFI_SSID, JoinOptions::new(WIFI_PASSWORD.as_bytes()))
-                .await
-            {
-                Ok(_) => {
-                    log::info!("WiFi joined");
-                    break;
-                }
-                Err(e) => {
-                    log::warn!("WiFi join failed: {:?}, retrying...", e);
-                    show!(i2c, "WERR");
-                    Timer::after(Duration::from_secs(2)).await;
-                    show!(i2c, "WIFI");
-                }
-            }
+        if current_outside_temp == -128 {
+            let frame_index = (Instant::now().as_millis() / (500 / 12)) as usize % 12;
+            let mut frame_bytes = [0u8; 17];
+            let (byte_index, byte) =
+                segment_to_frame_byte(LOADING[frame_index].0, LOADING[frame_index].1).unwrap();
+            frame_bytes[byte_index] |= byte;
+            i2c.write(ADDR, &frame_bytes).await.unwrap();
+            Timer::after(Duration::from_millis(10)).await;
+        } else {
+            let mut current_outside_temp_string: heapless::String<4> = heapless::String::new();
+            let _ = write!(current_outside_temp_string, "{:>3}C", current_outside_temp);
+            show!(i2c, current_outside_temp_string.as_str());
+            Timer::after(Duration::from_millis(100)).await;
         }
-
-        show!(i2c, "LINK");
-        while !stack.is_link_up() {
-            log::info!("Waiting for link up...");
-            Timer::after(Duration::from_millis(500)).await;
-        }
-
-        show!(i2c, "DHCP");
-        log::info!("Waiting for DHCP...");
-        stack.wait_config_up().await;
-        log::info!("Network up: {:?}", stack.config_v4());
-
-        static TCP_STATE: StaticCell<TcpClientState<2, 1024, 1024>> = StaticCell::new();
-        let tcp_state = TCP_STATE.init(TcpClientState::new());
-        let tcp_client = TcpClient::new(stack, tcp_state);
-        let dns_socket = DnsSocket::new(stack);
-        let mut client = HttpClient::new(&tcp_client, &dns_socket);
-
-        show!(i2c, "HTTP");
-        log::info!("Fetching weather...");
-
-        let _ = 'fetch: {
-            let mut req = match client.request(Method::GET, url).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("HTTP request failed: {:?}", e);
-                    break 'fetch false;
-                }
-            };
-
-            let mut rx_buf = [0u8; 4096];
-            let response = match req.send(&mut rx_buf).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("HTTP send failed: {:?}", e);
-                    break 'fetch false;
-                }
-            };
-
-            let mut body_buf = [0u8; 64];
-            let n = match response.body().reader().read(&mut body_buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    log::error!("Body read error: {:?}", e);
-                    break 'fetch false;
-                }
-            };
-
-            let s = match core::str::from_utf8(&body_buf[..n]) {
-                Ok(s) => s.trim().trim_start_matches('+').trim_end_matches("°C"),
-                Err(e) => {
-                    log::error!("Body not valid UTF-8: {:?}", e);
-                    break 'fetch false;
-                }
-            };
-            log::info!("s: {}", s);
-
-            let mut aligned: heapless::String<4> = heapless::String::new();
-            use core::fmt::Write;
-            let _ = write!(aligned, "{:>3}C", s);
-
-            log::info!("Showing: {}", aligned.as_str());
-
-            let _ = control.leave().await;
-            control
-                .set_power_management(cyw43::PowerManagementMode::Aggressive)
-                .await;
-
-            show!(i2c, aligned.as_str());
-
-            true
-        };
-
-        Timer::after(Duration::from_secs(15 * 60)).await;
     }
 }
