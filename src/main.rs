@@ -88,7 +88,6 @@ async fn join_wifi(
     wifi_ssid: &str,
     wifi_password: &str,
 ) {
-    log::info!("Joining wifi network '{}'", wifi_ssid);
     loop {
         match control
             .join(wifi_ssid, JoinOptions::new(wifi_password.as_bytes()))
@@ -108,13 +107,57 @@ async fn join_wifi(
             }
         }
     }
+
     while !stack.is_link_up() {
-        log::info!("Waiting for link up...");
+        log::trace!("Waiting for link up...");
         Timer::after(Duration::from_millis(500)).await;
     }
-    log::info!("Waiting for DHCP...");
+
+    log::trace!("Waiting for DHCP...");
     stack.wait_config_up().await;
     log::info!("Network up: {:?}", stack.config_v4());
+}
+
+async fn fetch_temperature(
+    client: &mut HttpClient<'_, TcpClient<'_, 2>, DnsSocket<'_>>,
+    wttr_url: &str,
+) -> Result<i8, &'static str> {
+    log::trace!("Creating http request...");
+    let mut req = client.request(Method::GET, wttr_url).await.map_err(|e| {
+        log::error!("HTTP request failed: {:?}", e);
+        "request failed"
+    })?;
+
+    log::trace!("Sending http request...");
+    let mut rx_buf = [0u8; 4096];
+    let response = req.send(&mut rx_buf).await.map_err(|e| {
+        log::error!("HTTP send failed: {:?}", e);
+        "send failed"
+    })?;
+
+    log::trace!("Reading http response...");
+    let mut body_buf = [0u8; 64];
+    let n = response
+        .body()
+        .reader()
+        .read(&mut body_buf)
+        .await
+        .map_err(|e| {
+            log::error!("Body read error: {:?}", e);
+            "read failed"
+        })?;
+
+    log::trace!("Parsing http response...");
+    let s = core::str::from_utf8(&body_buf[..n])
+        .map_err(|e| {
+            log::error!("Body not valid UTF-8: {:?}", e);
+            "utf8 error"
+        })?
+        .trim()
+        .trim_start_matches('+')
+        .trim_end_matches("°C");
+
+    Ok(s.parse().unwrap_or(-128))
 }
 
 #[embassy_executor::task]
@@ -132,58 +175,28 @@ async fn outside_temperature_task(
     let mut client = HttpClient::new(&tcp_client, &dns_socket);
 
     loop {
+        log::trace!("Setting wifi chip to no power management...");
         control
             .set_power_management(cyw43::PowerManagementMode::None)
             .await;
 
         if !stack.is_link_up() {
+            log::info!("Link is down, (re-)joining wifi...");
             join_wifi(&mut control, &stack, wifi_ssid, wifi_password).await;
         }
 
-        log::info!("Fetching outside temperature...");
+        log::trace!("Fetching outside temperature...");
+        match fetch_temperature(&mut client, wttr_url).await {
+            Ok(temp) => OUTSIDE_TEMP.store(temp, Ordering::Relaxed),
+            Err(e) => log::error!("Fetch failed: {}", e),
+        }
 
-        'fetch: {
-            let mut req = match client.request(Method::GET, wttr_url).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("HTTP request failed: {:?}", e);
-                    break 'fetch;
-                }
-            };
-
-            let mut rx_buf = [0u8; 4096];
-            let response = match req.send(&mut rx_buf).await {
-                Ok(r) => r,
-                Err(e) => {
-                    log::error!("HTTP send failed: {:?}", e);
-                    break 'fetch;
-                }
-            };
-
-            let mut body_buf = [0u8; 64];
-            let n = match response.body().reader().read(&mut body_buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    log::error!("Body read error: {:?}", e);
-                    break 'fetch;
-                }
-            };
-
-            let s = match core::str::from_utf8(&body_buf[..n]) {
-                Ok(s) => s.trim().trim_start_matches('+').trim_end_matches("°C"),
-                Err(e) => {
-                    log::error!("Body not valid UTF-8: {:?}", e);
-                    break 'fetch;
-                }
-            };
-
-            OUTSIDE_TEMP.store(s.parse().unwrap_or(-128), Ordering::Relaxed);
-        };
-
+        log::trace!("Setting wifi chip to aggressive power management...");
         control
             .set_power_management(cyw43::PowerManagementMode::Aggressive)
             .await;
 
+        log::info!("Waiting 15 minutes before fetching outside temperature again...");
         Timer::after(Duration::from_secs(15 * 60)).await;
     }
 }
