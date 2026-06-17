@@ -38,7 +38,8 @@ use {defmt_rtt as _, panic_probe as _};
 
 const ADDR: u8 = 0x71;
 
-static WIFI_ERROR: Mutex<CriticalSectionRawMutex, Option<heapless::String<4>>> = Mutex::new(None);
+static OUTSIDE_TEMPERATURE_TASK_ERROR: Mutex<CriticalSectionRawMutex, Option<&'static str>> =
+    Mutex::new(None);
 static DISPLAY_BRIGHTNESS: AtomicU8 = AtomicU8::new(9);
 static OUTSIDE_TEMP: AtomicI8 = AtomicI8::new(-128);
 
@@ -52,7 +53,7 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
+    embassy_usb_logger::run!(1024, log::LevelFilter::Trace, driver);
 }
 
 #[embassy_executor::task]
@@ -74,11 +75,80 @@ async fn potentiometer_brightness_task(
 ) {
     loop {
         let raw = adc.read(&mut pin).await.unwrap();
-        log::trace!("Raw brightness value (0 - 4095): {}", raw);
         let brightness = (raw / 256) as u8;
-        log::debug!("Brightness value (0 - 15): {}", brightness);
-        DISPLAY_BRIGHTNESS.store(brightness, Ordering::Relaxed);
+        let last_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
+
+        if brightness != last_brightness {
+            log::debug!("Brightness value (0 - 15): {}", brightness);
+            DISPLAY_BRIGHTNESS.store(brightness, Ordering::Relaxed);
+        }
+
         Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+#[derive(Debug)]
+enum WifiError {
+    MultipleFailedJoins,
+    LinkTimeout,
+    DhcpTimeout,
+}
+
+impl WifiError {
+    fn code(&self) -> &'static str {
+        match self {
+            WifiError::MultipleFailedJoins => "WE01",
+            WifiError::LinkTimeout => "WE02",
+            WifiError::DhcpTimeout => "WE03",
+        }
+    }
+}
+
+impl From<WifiError> for OutsideTemperatureTaskError {
+    fn from(e: WifiError) -> Self {
+        OutsideTemperatureTaskError::Wifi(e)
+    }
+}
+
+#[derive(Debug)]
+enum RequestError {
+    Request,
+    Send,
+    ReadingResponse,
+    Utf8Error,
+    ParsingResponse(heapless::String<64>),
+}
+
+impl RequestError {
+    fn code(&self) -> &'static str {
+        match self {
+            RequestError::Request => "RE01",
+            RequestError::Send => "RE02",
+            RequestError::ReadingResponse => "RE03",
+            RequestError::Utf8Error => "RE04",
+            RequestError::ParsingResponse(_) => "RE05",
+        }
+    }
+}
+
+impl From<RequestError> for OutsideTemperatureTaskError {
+    fn from(e: RequestError) -> Self {
+        OutsideTemperatureTaskError::Request(e)
+    }
+}
+
+#[derive(Debug)]
+enum OutsideTemperatureTaskError {
+    Wifi(WifiError),
+    Request(RequestError),
+}
+
+impl OutsideTemperatureTaskError {
+    fn code(&self) -> &'static str {
+        match self {
+            OutsideTemperatureTaskError::Wifi(e) => e.code(),
+            OutsideTemperatureTaskError::Request(e) => e.code(),
+        }
     }
 }
 
@@ -87,8 +157,13 @@ async fn join_wifi(
     stack: &Stack<'_>,
     wifi_ssid: &str,
     wifi_password: &str,
-) {
+) -> Result<(), WifiError> {
+    let join_deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        if Instant::now() > join_deadline {
+            return Err(WifiError::MultipleFailedJoins);
+        }
+
         match control
             .join(wifi_ssid, JoinOptions::new(wifi_password.as_bytes()))
             .await
@@ -99,41 +174,45 @@ async fn join_wifi(
             }
             Err(e) => {
                 log::warn!("Wifi join failed: {:?}, retrying...", e);
-                {
-                    let mut error = WIFI_ERROR.lock().await;
-                    *error = Some(heapless::String::try_from("WE01").unwrap());
-                }
-                Timer::after(Duration::from_secs(2)).await;
+                Timer::after(Duration::from_secs(5)).await;
             }
         }
     }
 
+    let link_deadline = Instant::now() + Duration::from_secs(30);
     while !stack.is_link_up() {
+        if Instant::now() > link_deadline {
+            return Err(WifiError::LinkTimeout);
+        }
         log::trace!("Waiting for link up...");
         Timer::after(Duration::from_millis(500)).await;
     }
 
     log::trace!("Waiting for DHCP...");
-    stack.wait_config_up().await;
+    embassy_time::with_timeout(Duration::from_secs(30), stack.wait_config_up())
+        .await
+        .map_err(|_| WifiError::DhcpTimeout)?;
+
     log::info!("Network up: {:?}", stack.config_v4());
+    Ok(())
 }
 
-async fn fetch_temperature(
+async fn fetch_outside_temperature(
     client: &mut HttpClient<'_, TcpClient<'_, 2>, DnsSocket<'_>>,
     wttr_url: &str,
-) -> Result<i8, &'static str> {
+) -> Result<i8, RequestError> {
     log::trace!("Creating http request...");
-    let mut req = client.request(Method::GET, wttr_url).await.map_err(|e| {
-        log::error!("HTTP request failed: {:?}", e);
-        "request failed"
-    })?;
+    let mut req = client
+        .request(Method::GET, wttr_url)
+        .await
+        .map_err(|_| RequestError::Request)?;
 
     log::trace!("Sending http request...");
     let mut rx_buf = [0u8; 4096];
-    let response = req.send(&mut rx_buf).await.map_err(|e| {
-        log::error!("HTTP send failed: {:?}", e);
-        "send failed"
-    })?;
+    let response = req
+        .send(&mut rx_buf)
+        .await
+        .map_err(|_| RequestError::Send)?;
 
     log::trace!("Reading http response...");
     let mut body_buf = [0u8; 64];
@@ -142,22 +221,34 @@ async fn fetch_temperature(
         .reader()
         .read(&mut body_buf)
         .await
-        .map_err(|e| {
-            log::error!("Body read error: {:?}", e);
-            "read failed"
-        })?;
+        .map_err(|_| RequestError::ReadingResponse)?;
 
     log::trace!("Parsing http response...");
     let s = core::str::from_utf8(&body_buf[..n])
-        .map_err(|e| {
-            log::error!("Body not valid UTF-8: {:?}", e);
-            "utf8 error"
-        })?
+        .map_err(|_| RequestError::Utf8Error)?
         .trim()
         .trim_start_matches('+')
         .trim_end_matches("°C");
 
-    Ok(s.parse().unwrap_or(-128))
+    s.parse::<i8>().map_err(|_| {
+        RequestError::ParsingResponse(heapless::String::try_from(s).unwrap_or_default())
+    })
+}
+
+async fn fetch_cycle(
+    control: &mut Control<'_>,
+    stack: &Stack<'_>,
+    client: &mut HttpClient<'_, TcpClient<'_, 2>, DnsSocket<'_>>,
+    wifi_ssid: &str,
+    wifi_password: &str,
+    wttr_url: &str,
+) -> Result<i8, OutsideTemperatureTaskError> {
+    if !stack.is_link_up() {
+        join_wifi(control, stack, wifi_ssid, wifi_password).await?;
+    }
+
+    let temp = fetch_outside_temperature(client, wttr_url).await?;
+    Ok(temp)
 }
 
 #[embassy_executor::task]
@@ -180,15 +271,26 @@ async fn outside_temperature_task(
             .set_power_management(cyw43::PowerManagementMode::None)
             .await;
 
-        if !stack.is_link_up() {
-            log::info!("Link is down, (re-)joining wifi...");
-            join_wifi(&mut control, &stack, wifi_ssid, wifi_password).await;
-        }
-
-        log::trace!("Fetching outside temperature...");
-        match fetch_temperature(&mut client, wttr_url).await {
-            Ok(temp) => OUTSIDE_TEMP.store(temp, Ordering::Relaxed),
-            Err(e) => log::error!("Fetch failed: {}", e),
+        match fetch_cycle(
+            &mut control,
+            &stack,
+            &mut client,
+            wifi_ssid,
+            wifi_password,
+            wttr_url,
+        )
+        .await
+        {
+            Ok(temp) => {
+                OUTSIDE_TEMP.store(temp, Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::error!("Fetching outside temperature failed: {:?}", e);
+                {
+                    let mut error = OUTSIDE_TEMPERATURE_TASK_ERROR.lock().await;
+                    *error = Some(e.code());
+                }
+            }
         }
 
         log::trace!("Setting wifi chip to aggressive power management...");
@@ -297,21 +399,36 @@ async fn main(spawner: Spawner) {
     loop {
         let current_outside_temp = OUTSIDE_TEMP.load(Ordering::Relaxed);
         let display_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
+        let wifi_error = {
+            let error = OUTSIDE_TEMPERATURE_TASK_ERROR.lock().await;
+            *error
+        };
+
         i2c.write(ADDR, &[0xE0 + display_brightness]).await.unwrap();
 
-        if current_outside_temp == -128 {
-            let frame_index = (Instant::now().as_millis() / (500 / 12)) as usize % 12;
-            let mut frame_bytes = [0u8; 17];
-            let (byte_index, byte) =
-                segment_to_frame_byte(LOADING[frame_index].0, LOADING[frame_index].1).unwrap();
-            frame_bytes[byte_index] |= byte;
-            i2c.write(ADDR, &frame_bytes).await.unwrap();
-            Timer::after(Duration::from_millis(10)).await;
-        } else {
-            let mut current_outside_temp_string: heapless::String<4> = heapless::String::new();
-            let _ = write!(current_outside_temp_string, "{:>3}C", current_outside_temp);
-            show!(i2c, current_outside_temp_string.as_str());
-            Timer::after(Duration::from_millis(100)).await;
+        match wifi_error {
+            Some(code) => {
+                show!(i2c, code);
+                Timer::after(Duration::from_millis(100)).await;
+            }
+            None => {
+                if current_outside_temp == -128 {
+                    let frame_index = (Instant::now().as_millis() / (500 / 12)) as usize % 12;
+                    let mut frame_bytes = [0u8; 17];
+                    let (byte_index, byte) =
+                        segment_to_frame_byte(LOADING[frame_index].0, LOADING[frame_index].1)
+                            .unwrap();
+                    frame_bytes[byte_index] |= byte;
+                    i2c.write(ADDR, &frame_bytes).await.unwrap();
+                    Timer::after(Duration::from_millis(10)).await;
+                } else {
+                    let mut current_outside_temp_string: heapless::String<4> =
+                        heapless::String::new();
+                    let _ = write!(current_outside_temp_string, "{:>3}C", current_outside_temp);
+                    show!(i2c, current_outside_temp_string.as_str());
+                    Timer::after(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
 }
