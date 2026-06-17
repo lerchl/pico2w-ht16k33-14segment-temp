@@ -35,7 +35,7 @@ pub enum RequestError {
     Send,
     ReadingResponse,
     Utf8Error,
-    ParsingResponse(heapless::String<64>),
+    ParsingResponse,
 }
 
 impl RequestError {
@@ -45,7 +45,7 @@ impl RequestError {
             RequestError::Send => "RE02",
             RequestError::ReadingResponse => "RE03",
             RequestError::Utf8Error => "RE04",
-            RequestError::ParsingResponse(_) => "RE05",
+            RequestError::ParsingResponse => "RE05",
         }
     }
 }
@@ -149,9 +149,7 @@ async fn send_request(
         .trim_start_matches('+')
         .trim_end_matches("°C");
 
-    s.parse::<i8>().map_err(|_| {
-        RequestError::ParsingResponse(heapless::String::try_from(s).unwrap_or_default())
-    })
+    s.parse::<i8>().map_err(|_| RequestError::ParsingResponse)
 }
 
 pub async fn fetch(
