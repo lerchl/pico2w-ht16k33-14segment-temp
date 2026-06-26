@@ -4,9 +4,9 @@
 mod animation;
 mod display;
 mod glyph;
-mod outside_temperature;
+mod weather;
 
-use core::sync::atomic::{AtomicI8, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use core::fmt::Write;
 use cyw43::{Control, aligned_bytes};
@@ -18,7 +18,7 @@ use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::{Stack, StackResources};
 use embassy_rp::adc::{Adc, Channel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::i2c::{Config, I2c};
+use embassy_rp::i2c::{Async, Config, I2c};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C1, PIO0, USB};
 use embassy_rp::pio::Pio;
 use embassy_rp::usb::Driver;
@@ -30,8 +30,8 @@ use embedded_hal_async::i2c::I2c as _;
 use reqwless::client::HttpClient;
 use static_cell::StaticCell;
 
-use crate::animation::LOADING;
 use crate::display::segment_to_frame_byte;
+use crate::weather::Weather;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -40,7 +40,7 @@ const ADDR: u8 = 0x71;
 static OUTSIDE_TEMPERATURE_TASK_ERROR: Mutex<CriticalSectionRawMutex, Option<&'static str>> =
     Mutex::new(None);
 static DISPLAY_BRIGHTNESS: AtomicU8 = AtomicU8::new(9);
-static OUTSIDE_TEMP: AtomicI8 = AtomicI8::new(-128);
+static WEATHER: Mutex<CriticalSectionRawMutex, Option<Weather>> = Mutex::new(None);
 
 bind_interrupts!(struct Irqs {
     I2C1_IRQ => embassy_rp::i2c::InterruptHandler<I2C1>;
@@ -73,16 +73,23 @@ async fn potentiometer_brightness_task(
     mut pin: Channel<'static>,
 ) {
     loop {
-        let raw = adc.read(&mut pin).await.unwrap();
-        let brightness = (raw / 256) as u8;
-        let last_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
+        match adc.read(&mut pin).await {
+            Ok(raw) => {
+                let brightness = (raw / 256) as u8;
+                let last_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
 
-        if brightness != last_brightness {
-            log::debug!("Brightness value (0 - 15): {}", brightness);
-            DISPLAY_BRIGHTNESS.store(brightness, Ordering::Relaxed);
+                if brightness != last_brightness {
+                    log::debug!("Brightness value (0 - 15): {}", brightness);
+                    DISPLAY_BRIGHTNESS.store(brightness, Ordering::Relaxed);
+                }
+
+                Timer::after(Duration::from_millis(100)).await;
+            }
+            Err(_) => {
+                log::error!("Could not read value from brightness potentiometer");
+                Timer::after(Duration::from_millis(5000)).await;
+            }
         }
-
-        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -106,7 +113,7 @@ async fn outside_temperature_task(
             .set_power_management(cyw43::PowerManagementMode::None)
             .await;
 
-        match outside_temperature::fetch(
+        match weather::fetch(
             &mut control,
             &stack,
             &mut client,
@@ -116,8 +123,9 @@ async fn outside_temperature_task(
         )
         .await
         {
-            Ok(temp) => {
-                OUTSIDE_TEMP.store(temp, Ordering::Relaxed);
+            Ok(w) => {
+                let mut weather = WEATHER.lock().await;
+                *weather = Some(w);
             }
             Err(e) => {
                 log::error!("Fetching outside temperature failed: {:?}", e);
@@ -145,7 +153,7 @@ async fn main(spawner: Spawner) {
     const WTTR_LOCATION: &str = env!("WTTR_LOCATION");
 
     const MAX_URL_LEN: usize = 128;
-    const UNPARAMETERIZED_URL: &str = "http://wttr.in/?format=%t";
+    const UNPARAMETERIZED_URL: &str = "http://wttr.in/?format=2";
 
     const _: () = {
         assert!(!WIFI_SSID.is_empty(), "WIFI_SSID must not be empty");
@@ -177,12 +185,16 @@ async fn main(spawner: Spawner) {
     i2c.write(ADDR, &[0x81]).await.unwrap();
     i2c.write(ADDR, &[0xE0]).await.unwrap();
 
-    macro_rules! show {
-        ($i2c:expr, $s:expr) => {
-            if let Ok(frame) = Display::from_str($s).and_then(|d| d.to_frame()) {
-                let _ = $i2c.write(ADDR, &frame).await;
+    async fn show(i2c: &mut I2c<'_, I2C1, Async>, s: &str) {
+        match Display::from_str(s).and_then(|d| d.to_frame()) {
+            Ok(frame) => {
+                log::debug!("Showing {}", s);
+                let _ = i2c.write(ADDR, &frame).await;
             }
-        };
+            Err(e) => {
+                log::error!("Could not show {}: {:?}", s, e);
+            }
+        }
     }
 
     // Set up wifi
@@ -223,7 +235,7 @@ async fn main(spawner: Spawner) {
     control.init(clm).await;
 
     let mut url: heapless::String<MAX_URL_LEN> = heapless::String::new();
-    let _ = write!(url, "http://wttr.in/{}?format=%t", WTTR_LOCATION);
+    let _ = write!(url, "http://wttr.in/{}?format=2", WTTR_LOCATION);
     static URL: StaticCell<heapless::String<MAX_URL_LEN>> = StaticCell::new();
     let url = URL.init(url);
 
@@ -232,7 +244,10 @@ async fn main(spawner: Spawner) {
     );
 
     loop {
-        let current_outside_temp = OUTSIDE_TEMP.load(Ordering::Relaxed);
+        let current_weather = {
+            let weather = WEATHER.lock().await;
+            *weather
+        };
         let display_brightness = DISPLAY_BRIGHTNESS.load(Ordering::Relaxed);
         let wifi_error = {
             let error = OUTSIDE_TEMPERATURE_TASK_ERROR.lock().await;
@@ -243,27 +258,69 @@ async fn main(spawner: Spawner) {
 
         match wifi_error {
             Some(code) => {
-                show!(i2c, code);
+                show(&mut i2c, code).await;
                 Timer::after(Duration::from_millis(100)).await;
             }
-            None => {
-                if current_outside_temp == -128 {
-                    let frame_index = (Instant::now().as_millis() / (500 / 12)) as usize % 12;
+            None => match current_weather {
+                Some(weather) => {
+                    let display_loop_timestamp = Instant::now().as_millis() % 30_000;
+
+                    if display_loop_timestamp < 20_000 {
+                        let mut current_outside_temp_string: heapless::String<4> =
+                            heapless::String::new();
+                        let _ =
+                            write!(current_outside_temp_string, "{:>3}C", weather.temperature_c);
+                        show(&mut i2c, current_outside_temp_string.as_str()).await;
+                        Timer::after(Duration::from_millis(100)).await;
+                    } else if display_loop_timestamp < 25_000 {
+                        let animation = weather.condition.animation();
+
+                        let frame_index = (Instant::now().as_millis()
+                            / (animation.duration / animation.frames.len() as u64))
+                            as usize
+                            % animation.frames.len();
+
+                        match animation::build_frame_bytes(animation, frame_index) {
+                            Ok(frame_bytes) => {
+                                i2c.write(ADDR, &frame_bytes).await.unwrap();
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Error building frame byte for animation of weather condition {}: {:?}",
+                                    weather.condition,
+                                    e
+                                )
+                            }
+                        }
+
+                        Timer::after(Duration::from_millis(10)).await;
+                    } else {
+                        let mut current_wind_string: heapless::String<4> = heapless::String::new();
+                        let _ = write!(current_wind_string, "{}", weather.wind);
+                        show(&mut i2c, current_wind_string.as_str()).await;
+                        Timer::after(Duration::from_millis(100)).await;
+                    }
+                }
+                None => {
+                    let animation = animation::LOADING;
+
+                    let frame_index = (Instant::now().as_millis()
+                        / (animation.duration / animation.frames.len() as u64))
+                        as usize
+                        % animation.frames.len();
                     let mut frame_bytes = [0u8; 17];
-                    let (byte_index, byte) =
-                        segment_to_frame_byte(LOADING[frame_index].0, LOADING[frame_index].1)
-                            .unwrap();
-                    frame_bytes[byte_index] |= byte;
+                    for character_segment in animation.frames[frame_index].character_segments {
+                        let (byte_index, byte) = segment_to_frame_byte(
+                            character_segment.character,
+                            character_segment.segment,
+                        )
+                        .unwrap();
+                        frame_bytes[byte_index] |= byte;
+                    }
                     i2c.write(ADDR, &frame_bytes).await.unwrap();
                     Timer::after(Duration::from_millis(10)).await;
-                } else {
-                    let mut current_outside_temp_string: heapless::String<4> =
-                        heapless::String::new();
-                    let _ = write!(current_outside_temp_string, "{:>3}C", current_outside_temp);
-                    show!(i2c, current_outside_temp_string.as_str());
-                    Timer::after(Duration::from_millis(100)).await;
                 }
-            }
+            },
         }
     }
 }

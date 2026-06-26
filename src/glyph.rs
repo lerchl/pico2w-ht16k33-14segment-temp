@@ -142,8 +142,7 @@ pub fn glyph(c: char) -> Result<&'static [Segment], DisplayError> {
             Segment::TopHorizontal,
             Segment::TopLeftVertical,
             Segment::MiddleLeft,
-            Segment::MiddleRight,
-            Segment::BottomRightVertical,
+            Segment::BottomRightDiagonal,
             Segment::BottomHorizontal,
         ],
         'T' => &[

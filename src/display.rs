@@ -60,6 +60,39 @@ use crate::glyph::glyph;
 //     ‾‾‾‾‾‾‾‾‾‾‾        ‾‾‾‾‾‾‾‾‾‾‾         ‾‾‾‾‾‾‾‾‾‾‾        ‾‾‾‾‾‾‾‾‾‾‾
 //
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CharacterIndex {
+    One,
+    Two,
+    Three,
+    Four,
+}
+
+impl TryFrom<usize> for CharacterIndex {
+    type Error = ();
+
+    fn try_from(index: usize) -> Result<Self, Self::Error> {
+        match index {
+            0 => Ok(CharacterIndex::One),
+            1 => Ok(CharacterIndex::Two),
+            2 => Ok(CharacterIndex::Three),
+            3 => Ok(CharacterIndex::Four),
+            _ => Err(()),
+        }
+    }
+}
+
+impl CharacterIndex {
+    pub fn first_byte_index(&self) -> usize {
+        match self {
+            CharacterIndex::One => 3,
+            CharacterIndex::Two => 5,
+            CharacterIndex::Three => 7,
+            CharacterIndex::Four => 9,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Segment {
     TopHorizontal,
@@ -80,12 +113,14 @@ pub enum Segment {
 
 #[derive(Debug)]
 pub enum DisplayError {
-    InvalidCharacterIndex(usize),
+    // Is logged
+    #[allow(dead_code)]
     UnknownGlyph(char),
 }
 
+#[derive(Debug)]
 pub struct Character {
-    pub index: usize,
+    pub index: CharacterIndex,
     pub segments: Vec<Segment, 14>,
 }
 
@@ -95,33 +130,23 @@ pub struct Display {
 
 impl Display {
     pub fn from_str(s: &str) -> Result<Self, DisplayError> {
-        let mut characters = [
-            Character {
-                index: 1,
-                segments: Vec::new(),
-            },
-            Character {
-                index: 2,
-                segments: Vec::new(),
-            },
-            Character {
-                index: 3,
-                segments: Vec::new(),
-            },
-            Character {
-                index: 4,
-                segments: Vec::new(),
-            },
-        ];
+        let characters = s
+            .chars()
+            .enumerate()
+            .take(4)
+            .map(|(index, char)| {
+                let segments = glyph(char)?;
+                // CharacterIndex::try_from cannot fail due to .take(4) above!
+                Ok(Character {
+                    index: CharacterIndex::try_from(index).unwrap(),
+                    segments: segments.iter().copied().collect(),
+                })
+            })
+            .collect::<Result<heapless::Vec<Character, 4>, DisplayError>>()?;
 
-        for (i, c) in s.chars().enumerate().take(4) {
-            let segments = glyph(c)?;
-            characters[i] = Character {
-                index: i + 1,
-                segments: segments.iter().copied().collect(),
-            };
-        }
-        Ok(Self { characters })
+        Ok(Self {
+            characters: characters.into_array().unwrap(),
+        })
     }
 
     pub fn to_frame(&self) -> Result<[u8; 17], DisplayError> {
@@ -137,29 +162,23 @@ impl Display {
 }
 
 pub fn segment_to_frame_byte(
-    character_index: usize,
+    character_index: CharacterIndex,
     segment: Segment,
 ) -> Result<(usize, u8), DisplayError> {
-    if character_index < 1 || character_index > 4 {
-        return Err(DisplayError::InvalidCharacterIndex(character_index));
-    }
-
-    let char_first_byte_index = 3 + (character_index - 1) * 2;
+    let char_first_byte_index = character_index.first_byte_index();
 
     let top_right_diagonal_bitmask = || match character_index {
-        1 => 0b00010000,
-        2 => 0b01000000,
-        3 => 0b00100000,
-        4 => 0b00000100,
-        _ => unreachable!(),
+        CharacterIndex::One => 0b00010000,
+        CharacterIndex::Two => 0b01000000,
+        CharacterIndex::Three => 0b00100000,
+        CharacterIndex::Four => 0b00000100,
     };
 
     let bottom_right_diagonal_bitmask = || match character_index {
-        1 => 0b00001000,
-        2 => 0b01000000,
-        3 => 0b00000010,
-        4 => 0b00000001,
-        _ => unreachable!(),
+        CharacterIndex::One => 0b00001000,
+        CharacterIndex::Two => 0b01000000,
+        CharacterIndex::Three => 0b00000010,
+        CharacterIndex::Four => 0b00000001,
     };
 
     Ok(match segment {
@@ -168,7 +187,11 @@ pub fn segment_to_frame_byte(
         Segment::TopLeftDiagonal => (char_first_byte_index, 0b10000000),
         Segment::TopMiddleVertical => (char_first_byte_index + 1, 0b00100000),
         Segment::TopRightDiagonal => (
-            if character_index == 4 { 12 } else { 11 },
+            if character_index == CharacterIndex::Four {
+                12
+            } else {
+                11
+            },
             top_right_diagonal_bitmask(),
         ),
         Segment::TopRightVertical => (char_first_byte_index, 0b01000000),
@@ -178,7 +201,11 @@ pub fn segment_to_frame_byte(
         Segment::BottomLeftDiagonal => (char_first_byte_index + 1, 0b00010000),
         Segment::BottomMiddleVertical => (char_first_byte_index + 1, 0b00001000),
         Segment::BottomRightDiagonal => (
-            if character_index == 1 { 11 } else { 12 },
+            if character_index == CharacterIndex::One {
+                11
+            } else {
+                12
+            },
             bottom_right_diagonal_bitmask(),
         ),
         Segment::BottomRightVertical => (char_first_byte_index, 0b00100000),
